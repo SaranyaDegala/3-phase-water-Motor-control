@@ -1,0 +1,235 @@
+/****************************************************
+ * Project: Water Motor Control
+ * Hardware: ESP32, Water Level Sensors, Relay, Switch
+ * Function: Automatically controls a motor pump 
+ *           based on tank water levels and manual input
+ ****************************************************/
+
+// Include required libraries
+#include <WiFi.h>              // Library to connect ESP32 to WiFi
+#include <WiFiClientSecure.h>  // Enables secure (SSL/TLS) communication over WiFi
+#include <PubSubClient.h>      // MQTT client library to connect ESP32 to MQTT broker
+#include "Secrets.h"           // Custom file to securely store sensitive data (WiFi, MQTT credentials)
+#include <ArduinoJson.h>       // For handling JSON (used in requests/responses)
+#include <LittleFS.h>          // File system library to store/read data in ESP32 flash memory
+#include <EEPROM.h>            // Library to read/write non-volatile memory (EEPROM storage)
+#include <WebServer.h>         // Local web server to interact with ESP32 via browser
+
+// Define pin connections for hardware
+#define MOTOR_RELAY_PIN 5      // GPIO pin connected to Relay (to control motor ON/OFF)
+#define SWITCH_PIN      13     // GPIO pin connected to manual switch (for manual motor control)
+#define LEVEL_LOW_PIN   25     // GPIO pin connected to water level LOW sensor
+#define LEVEL_MED_PIN   26     // GPIO pin connected to water level MEDIUM sensor
+#define LEVEL_HIGH_PIN  27     // GPIO pin connected to water level HIGH sensor
+
+// Global variables for states
+bool motorState = false;       // Stores whether the motor is currently ON (true) or OFF (false)
+bool lastSwitchState = HIGH;   // Tracks last state of manual switch (used for detecting button press)
+unsigned long lastDebounceTime = 0;   // Stores time of last switch press (for debounce handling)
+unsigned long debounceDelay = 50;     // Debounce delay in milliseconds (to avoid false triggers)
+
+// WiFi and MQTT configuration
+WiFiClientSecure espClient;            // Secure WiFi client object
+PubSubClient client(espClient);        // MQTT client object (works on top of WiFi client)
+WebServer server(80);                  // Web server running on port 80
+
+/**********************
+ * Function Prototypes
+ **********************/
+void setupWiFi();                      // Function to connect ESP32 to WiFi
+void reconnect();                      // Function to reconnect ESP32 to MQTT broker if disconnected
+void callback(char* topic, byte* payload, unsigned int length); // Handles incoming MQTT messages
+void handleRoot();                     // Web server handler for root URL "/"
+void saveMotorState(bool state);       // Saves motor state in EEPROM
+bool readMotorState();                 // Reads last saved motor state from EEPROM
+
+/**********************
+ * Setup function
+ **********************/
+void setup() {
+  Serial.begin(115200);                // Initialize serial communication at 115200 baud (for debugging)
+
+  // Set pin modes
+  pinMode(MOTOR_RELAY_PIN, OUTPUT);    // Relay pin set as OUTPUT (controls motor)
+  pinMode(SWITCH_PIN, INPUT_PULLUP);   // Switch pin set as INPUT with internal PULLUP resistor
+  pinMode(LEVEL_LOW_PIN, INPUT);       // Low-level sensor pin as INPUT
+  pinMode(LEVEL_MED_PIN, INPUT);       // Medium-level sensor pin as INPUT
+  pinMode(LEVEL_HIGH_PIN, INPUT);      // High-level sensor pin as INPUT
+
+  // Initialize EEPROM with 512 bytes of storage
+  EEPROM.begin(512);
+
+  // Restore last motor state from EEPROM and set relay accordingly
+  motorState = readMotorState();
+  digitalWrite(MOTOR_RELAY_PIN, motorState ? HIGH : LOW);
+
+  // Start WiFi connection
+  setupWiFi();
+
+  // Configure MQTT server
+  client.setServer(MQTT_SERVER, MQTT_PORT);   // Set MQTT broker address and port
+  client.setCallback(callback);               // Define callback function to handle MQTT messages
+
+  // Start local web server and define root handler
+  server.on("/", handleRoot);                 // When user visits "/", run handleRoot()
+  server.begin();                             // Start the web server
+}
+
+/**********************
+ * Main Loop
+ **********************/
+void loop() {
+  // Ensure MQTT connection is alive
+  if (!client.connected()) {
+    reconnect();                              // Reconnect to MQTT broker if disconnected
+  }
+  client.loop();                              // Keep MQTT client running
+
+  // Handle web server requests
+  server.handleClient();
+
+  // Read manual switch state
+  int switchState = digitalRead(SWITCH_PIN);
+
+  // Debounce check for switch press
+  if (switchState != lastSwitchState) {
+    lastDebounceTime = millis();              // Update debounce timer
+  }
+
+  // If stable switch state after debounce delay
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    if (switchState == LOW && lastSwitchState == HIGH) { // Switch pressed
+      motorState = !motorState;               // Toggle motor state
+      digitalWrite(MOTOR_RELAY_PIN, motorState ? HIGH : LOW); // Turn motor ON/OFF
+      saveMotorState(motorState);             // Save new state to EEPROM
+      Serial.println(motorState ? "Motor ON" : "Motor OFF");
+    }
+  }
+
+  // Update last switch state
+  lastSwitchState = switchState;
+
+  // Read water level sensors
+  bool lowLevel = digitalRead(LEVEL_LOW_PIN);   // Tank empty sensor
+  bool medLevel = digitalRead(LEVEL_MED_PIN);   // Tank half sensor
+  bool highLevel = digitalRead(LEVEL_HIGH_PIN); // Tank full sensor
+
+  // Automatic motor control based on water level
+  if (lowLevel == LOW && !motorState) {        // If tank empty and motor OFF
+    motorState = true;                         // Turn motor ON
+    digitalWrite(MOTOR_RELAY_PIN, HIGH);
+    saveMotorState(motorState);
+    Serial.println("Tank Empty → Motor ON");
+  }
+  else if (highLevel == HIGH && motorState) {  // If tank full and motor ON
+    motorState = false;                        // Turn motor OFF
+    digitalWrite(MOTOR_RELAY_PIN, LOW);
+    saveMotorState(motorState);
+    Serial.println("Tank Full → Motor OFF");
+  }
+}
+// Switch motor ON or OFF using relays
+void setMotor(bool state) {
+  if (state != motorState) {
+    motorState = state;
+
+    if (motorState) {
+      digitalWrite(RELAY_ON_PIN, HIGH);  // Activate ON relay
+      Serial.println("ON relay activated");
+      delay(2000);
+      digitalWrite(RELAY_ON_PIN, LOW);   // Deactivate after pulse
+      Serial.println("ON relay deactivated");
+    } else {
+      digitalWrite(RELAY_OFF_PIN, HIGH); // Activate OFF relay
+      Serial.println("OFF relay activated");
+      delay(2000);
+      digitalWrite(RELAY_OFF_PIN, LOW);
+      Serial.println("OFF relay deactivated");
+    }
+
+    Serial.println(motorState ? "Motor ON" : "Motor OFF");
+    publishStatus();
+    manualToggle = false;
+  }
+}
+
+
+/**********************
+ * Function Definitions
+ **********************/
+
+// Connect ESP32 to WiFi
+void setupWiFi() {
+  delay(10);
+  Serial.println("Connecting to WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);        // Start WiFi connection
+
+  while (WiFi.status() != WL_CONNECTED) {      // Wait until connected
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());              // Print assigned IP address
+}
+
+// Reconnect to MQTT broker if disconnected
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    if (client.connect("ESP32Client", MQTT_USER, MQTT_PASSWORD)) {
+      Serial.println("connected");
+      client.subscribe("watermotor/control");  // Subscribe to MQTT topic
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());            // Print error state
+      Serial.println(" retrying in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// MQTT callback to handle incoming messages
+void callback(char* topic, byte* payload, unsigned int length) {
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("] ");
+
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];               // Convert payload to string
+  }
+  Serial.println(message);
+
+  // Process motor control command from MQTT
+  if (message == "ON") {
+    motorState = true;
+    digitalWrite(MOTOR_RELAY_PIN, HIGH);
+    saveMotorState(motorState);
+  }
+  else if (message == "OFF") {
+    motorState = false;
+    digitalWrite(MOTOR_RELAY_PIN, LOW);
+    saveMotorState(motorState);
+  }
+}
+
+// Web server root handler
+void handleRoot() {
+  String html = "<html><body><h1>Water Motor Control</h1>";
+  html += "<p>Motor is currently: ";
+  html += motorState ? "ON" : "OFF";
+  html += "</p></body></html>";
+  server.send(200, "text/html", html);         // Send HTML response to client
+}
+
+// Save motor state in EEPROM
+void saveMotorState(bool state) {
+  EEPROM.write(0, state ? 1 : 0);              // Store 1 for ON, 0 for OFF at EEPROM address 0
+  EEPROM.commit();                             // Save changes permanently
+}
+
+// Read motor state from EEPROM
+bool readMotorState() {
+  return EEPROM.read(0) == 1;                  // Return true if 1, false if 0
+}
